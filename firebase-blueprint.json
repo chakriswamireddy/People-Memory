@@ -1,0 +1,14 @@
+{
+  "entities": {
+    "Memory": {
+      "type": "object",
+      "required": ["memoryId", "contactName", "title", "content", "category", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/memories/{memoryId}": {
+      "schema": "Memory",
+      "description": "User-isolated collection of personal memories."
+    }
+  }
+}
