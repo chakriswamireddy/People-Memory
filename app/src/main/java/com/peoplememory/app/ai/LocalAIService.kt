@@ -1,8 +1,13 @@
 package com.peoplememory.app.ai
 
 import android.content.Context
-import com.google.ai.edge.litertlm.LlmInference
-import com.google.ai.edge.litertlm.LlmInferenceOptions
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Conversation
+import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.Message
+import com.google.ai.edge.litertlm.SamplerConfig
 import com.peoplememory.app.model.CloudMemory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -11,9 +16,11 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+@Suppress("UNUSED_PARAMETER")
 class LocalAIService(private val context: Context) {
 
-    private var llmInference: LlmInference? = null
+    private var engine: Engine? = null
+    private var conversation: Conversation? = null
     private var isInitialized = false
 
     suspend fun initialize(modelFile: File): Result<Unit> = withContext(Dispatchers.IO) {
@@ -24,31 +31,58 @@ class LocalAIService(private val context: Context) {
 
             release()
 
-            val options = LlmInferenceOptions.builder()
-                .setModelPath(modelFile.absolutePath)
-                .setMaxTokens(1024)
-                .setTopK(20)
-                .setTemperature(0.2f) // Low temperature for high factual accuracy
-                .build()
+            val newEngine = Engine(
+                EngineConfig(
+                    modelPath = modelFile.absolutePath,
+                    maxNumTokens = 1024
+                )
+            )
+            engine = newEngine
+            newEngine.initialize()
 
-            llmInference = LlmInference.createFromOptions(context, options)
+            conversation = newEngine.createConversation(
+                ConversationConfig(
+                    samplerConfig = SamplerConfig(
+                        topK = 20,
+                        topP = 1.0,
+                        temperature = 0.2,
+                        seed = 0
+                    )
+                )
+            )
+
             isInitialized = true
             Result.success(Unit)
         } catch (e: Exception) {
-            isInitialized = false
-            llmInference = null
+            release()
             Result.failure(e)
         }
     }
 
-    fun isReady(): Boolean = isInitialized && llmInference != null
+    fun isReady(): Boolean = isInitialized && engine != null && conversation != null
+
+    private fun generateResponse(prompt: String): Result<String> {
+        val activeConversation = conversation
+            ?: return Result.failure(IllegalStateException("Local AI model is not initialized."))
+
+        return try {
+            val response = activeConversation.sendMessage(Message.of(prompt))
+            val text = response.contents.joinToString("") { content ->
+                (content as? Content.Text)?.text.orEmpty()
+            }
+            Result.success(text)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 
     /**
      * AI Feature 1: Rewrite Memory with Strict Factual Preservation
      */
     suspend fun rewriteMemory(originalText: String): Result<String> = withContext(Dispatchers.Default) {
-        val inference = llmInference
-            ?: return@withContext Result.failure(IllegalStateException("Local AI model is not initialized."))
+        if (!isReady()) {
+            return@withContext Result.failure(IllegalStateException("Local AI model is not initialized."))
+        }
 
         if (originalText.isBlank()) return@withContext Result.success(originalText)
 
@@ -69,16 +103,17 @@ class LocalAIService(private val context: Context) {
             append("\n<end_of_turn>\n<start_of_turn>model\n")
         }
 
-        try {
-            val response = inference.generateResponse(prompt).trim()
-            val sanitized = response
-                .removePrefix("Here is the rewritten memory:")
-                .removePrefix("Rewritten memory:")
-                .trim()
-            Result.success(sanitized)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
+        val result = generateResponse(prompt)
+        val raw = result.getOrNull()
+            ?: return@withContext Result.failure(
+                result.exceptionOrNull() ?: IllegalStateException("Inference failed")
+            )
+
+        val sanitized = raw.trim()
+            .removePrefix("Here is the rewritten memory:")
+            .removePrefix("Rewritten memory:")
+            .trim()
+        Result.success(sanitized)
     }
 
     /**
@@ -88,8 +123,9 @@ class LocalAIService(private val context: Context) {
         contactName: String,
         memories: List<CloudMemory>
     ): Result<String> = withContext(Dispatchers.Default) {
-        val inference = llmInference
-            ?: return@withContext Result.failure(IllegalStateException("Local AI model is not initialized."))
+        if (!isReady()) {
+            return@withContext Result.failure(IllegalStateException("Local AI model is not initialized."))
+        }
 
         if (memories.isEmpty()) return@withContext Result.success("No memories recorded yet for $contactName.")
 
@@ -118,12 +154,12 @@ class LocalAIService(private val context: Context) {
             append("\n<end_of_turn>\n<start_of_turn>model\n")
         }
 
-        try {
-            val response = inference.generateResponse(prompt).trim()
-            Result.success(response)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
+        val result = generateResponse(prompt)
+        val raw = result.getOrNull()
+            ?: return@withContext Result.failure(
+                result.exceptionOrNull() ?: IllegalStateException("Inference failed")
+            )
+        Result.success(raw.trim())
     }
 
     private suspend fun batchSummarizeMemories(
@@ -140,10 +176,10 @@ class LocalAIService(private val context: Context) {
                 "[$d] (${m.category}) ${m.title}: ${m.content}"
             }
             val batchPrompt = "<start_of_turn>user\nExtract key factual events and sentiments with $contactName from batch ${index + 1}:\n$chunkText\n<end_of_turn>\n<start_of_turn>model\n"
-            try {
-                val intermediate = llmInference?.generateResponse(batchPrompt)?.trim()
-                if (!intermediate.isNullOrBlank()) intermediateNotes.add(intermediate)
-            } catch (e: Exception) {
+            val intermediate = generateResponse(batchPrompt).getOrNull()
+            if (!intermediate.isNullOrBlank()) {
+                intermediateNotes.add(intermediate.trim())
+            } else {
                 intermediateNotes.add(chunkText.take(500))
             }
         }
@@ -152,11 +188,17 @@ class LocalAIService(private val context: Context) {
 
     fun release() {
         try {
-            llmInference?.close()
+            conversation?.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        try {
+            engine?.close()
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
-            llmInference = null
+            conversation = null
+            engine = null
             isInitialized = false
         }
     }
